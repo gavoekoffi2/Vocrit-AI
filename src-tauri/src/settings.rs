@@ -731,31 +731,14 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
     changed
 }
 
+/// One-time platform migrations. IMPORTANT: this runs on every settings read,
+/// so it must only correct states the user cannot reach through the UI —
+/// re-applying "preferences" here would permanently override user choices
+/// (e.g. a French user enabling translation, or selecting auto language
+/// detection, would see their choice silently reverted on the next read).
 fn normalize_platform_settings(settings: &mut AppSettings) -> bool {
+    #[allow(unused_mut)]
     let mut changed = false;
-
-    if settings.selected_language == "auto" {
-        if let Some(language) = infer_transcription_language(&settings.app_language) {
-            debug!(
-                "Migrating transcription language from auto to '{}' based on app language '{}'",
-                language, settings.app_language
-            );
-            settings.selected_language = language;
-            changed = true;
-        }
-    }
-
-    if settings.app_language.to_lowercase().starts_with("fr") && settings.translate_to_english {
-        debug!("Disabling translate_to_english for French locale settings");
-        settings.translate_to_english = false;
-        changed = true;
-    }
-
-    if !settings.lazy_stream_close {
-        debug!("Enabling lazy_stream_close to reduce repeated dictation latency");
-        settings.lazy_stream_close = true;
-        changed = true;
-    }
 
     #[cfg(target_os = "windows")]
     {
@@ -765,6 +748,9 @@ fn normalize_platform_settings(settings: &mut AppSettings) -> bool {
             changed = true;
         }
     }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = settings;
 
     changed
 }
@@ -995,9 +981,29 @@ pub fn get_bindings(app: &AppHandle) -> HashMap<String, ShortcutBinding> {
 pub fn get_stored_binding(app: &AppHandle, id: &str) -> ShortcutBinding {
     let bindings = get_bindings(app);
 
-    let binding = bindings.get(id).unwrap().clone();
-
-    binding
+    // Fall back to the platform default if the stored settings are missing
+    // this binding (e.g. settings file edited by hand or from an older build)
+    // instead of panicking and taking the whole app down.
+    match bindings.get(id) {
+        Some(binding) => binding.clone(),
+        None => {
+            warn!(
+                "Binding '{}' missing from stored settings; using default",
+                id
+            );
+            get_default_settings()
+                .bindings
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| ShortcutBinding {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    description: String::new(),
+                    default_binding: String::new(),
+                    current_binding: String::new(),
+                })
+        }
+    }
 }
 
 pub fn get_history_limit(app: &AppHandle) -> usize {

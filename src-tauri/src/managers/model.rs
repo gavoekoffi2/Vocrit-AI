@@ -801,14 +801,10 @@ impl ModelManager {
             }
         }
 
-        // If no model is selected, pick the preferred bundled model first.
-        // Also migrate bundled defaults that proved too slow for mainstream
-        // Windows machines back to the fast French-capable model.
-        let should_prefer_fast_default = settings.selected_model.is_empty()
-            || settings.selected_model == "parakeet-tdt-0.6b-v3"
-            || settings.selected_model == "turbo";
-
-        if should_prefer_fast_default {
+        // Only auto-select when nothing is selected. Never override an
+        // explicit user choice — doing so on every startup made the model
+        // picker useless (any selection reverted after a restart).
+        if settings.selected_model.is_empty() {
             let models = self.available_models.lock().unwrap();
             let available_model = models
                 .get("canary-180m-flash")
