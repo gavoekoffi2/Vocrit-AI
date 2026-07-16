@@ -22,10 +22,23 @@ npm run dev            # or: npm start
 By default the service listens on `http://localhost:3000` and stores data in
 `backend/vocrit.db` (SQLite).
 
-If `MONEY_FUSION_API_KEY` is not set the service runs in **stub mode**: the
-checkout URL points to `/api/dev/fake-pay` which simulates a successful
-payment — useful for testing the desktop app end-to-end without a real
-merchant account.
+If `MONEY_FUSION_API_KEY` is not set **and** `NODE_ENV` is not `production`,
+the service runs in **stub mode**: the checkout URL points to
+`/api/dev/fake-pay` which simulates a successful payment — useful for testing
+the desktop app end-to-end without a real merchant account. The
+`/api/dev/fake-pay` route is only registered in stub mode; it never exists in
+production.
+
+## Security requirements (production)
+
+- `MONEY_FUSION_WEBHOOK_SECRET` **must** be set in production. Webhooks are
+  rejected when it is missing — an unsigned webhook endpoint would let anyone
+  mark sessions as paid and mint licenses.
+- `ADMIN_MASTER_KEY` is optional; when unset, both `/api/admin/grant` and the
+  desktop offline admin-key path are disabled (fail closed).
+- The desktop app now verifies every license key against
+  `POST /api/license/verify` before activating it — keys are never trusted
+  client-side.
 
 ## Endpoints
 

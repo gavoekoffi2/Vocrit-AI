@@ -23,14 +23,11 @@ pub const SUBSCRIPTION_CURRENCY: &str = "XOF";
 pub const SUBSCRIPTION_DURATION_DAYS: i64 = 365;
 
 /// Master admin key — bearer gets AdminFree tier forever.
-/// Override at build time with `VOCRIT_ADMIN_MASTER_KEY` env var.
-/// Keeping a default placeholder means the shipping binary has a pre-baked
-/// key the project owner can use, but any production build SHOULD set a real
-/// value through the environment.
-pub const ADMIN_MASTER_KEY: &str = match option_env!("VOCRIT_ADMIN_MASTER_KEY") {
-    Some(k) => k,
-    None => "VOCRIT-ADMIN-FOREVER-CHANGE-ME",
-};
+/// Set at build time with the `VOCRIT_ADMIN_MASTER_KEY` env var. When the
+/// variable is not set, the offline admin-key path is DISABLED: shipping a
+/// hardcoded default key would let anyone who reads the public repo (or runs
+/// `strings` on the binary) unlock the app forever.
+pub const ADMIN_MASTER_KEY: Option<&str> = option_env!("VOCRIT_ADMIN_MASTER_KEY");
 
 /// Admin emails that auto-upgrade to AdminFree when activated.
 /// Override with `VOCRIT_ADMIN_EMAILS` (comma separated) at build time.
@@ -173,7 +170,10 @@ fn effective_tier(state: &SubscriptionState) -> SubscriptionTier {
 
 fn to_status(state: &SubscriptionState) -> SubscriptionStatus {
     let tier = effective_tier(state);
-    let is_unlimited = matches!(tier, SubscriptionTier::Premium | SubscriptionTier::AdminFree);
+    let is_unlimited = matches!(
+        tier,
+        SubscriptionTier::Premium | SubscriptionTier::AdminFree
+    );
     let remaining = if is_unlimited {
         u64::MAX
     } else {
@@ -201,7 +201,10 @@ pub fn try_consume_chars(app: &AppHandle, char_count: u64) -> Result<Subscriptio
     let reset = maybe_reset_quota(&mut state);
 
     let tier = effective_tier(&state);
-    if matches!(tier, SubscriptionTier::Premium | SubscriptionTier::AdminFree) {
+    if matches!(
+        tier,
+        SubscriptionTier::Premium | SubscriptionTier::AdminFree
+    ) {
         if reset {
             save_state(app, &state);
         }
@@ -272,16 +275,25 @@ pub fn record_transcription_usage(
     try_consume_chars(&app, char_count)
 }
 
-/// Activate a license key. Keys starting with `VOCRIT-ADMIN-` are treated
-/// specially: when the key matches the configured `ADMIN_MASTER_KEY`, the
-/// account is upgraded to `AdminFree` forever.
+fn backend_base_url() -> String {
+    option_env!("VOCRIT_LICENSE_BACKEND_URL")
+        .unwrap_or("https://api.vocrit.ai")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Activate a license key.
 ///
-/// For normal premium keys this currently stores the key locally and marks
-/// the user Premium until +365 days. Production builds SHOULD add a network
-/// verification step against the license backend before trusting the key.
+/// Admin paths (checked locally, work offline):
+/// - the key matches the build-time `VOCRIT_ADMIN_MASTER_KEY` (if configured)
+/// - the email is in the build-time `VOCRIT_ADMIN_EMAILS` list
+///
+/// Every other key is verified against the licensing backend
+/// (`/api/license/verify`) before any tier upgrade is stored. A key is never
+/// trusted just because the user typed it.
 #[tauri::command]
 #[specta::specta]
-pub fn activate_license(
+pub async fn activate_license(
     app: AppHandle,
     email: String,
     license_key: String,
@@ -297,24 +309,80 @@ pub fn activate_license(
 
     let mut state = load_state(&app);
     ensure_device_id(&mut state);
-    state.email = Some(email_norm.clone());
-    state.license_key = Some(key_norm.clone());
+    let device_id = state.device_id.clone().unwrap_or_default();
 
-    let is_admin_key = key_norm == ADMIN_MASTER_KEY;
+    let is_admin_key = ADMIN_MASTER_KEY.is_some_and(|k| !k.is_empty() && key_norm == k);
     let is_admin_email = admin_emails().contains(&email_norm);
 
     if is_admin_key || is_admin_email {
+        state.email = Some(email_norm.clone());
+        state.license_key = Some(key_norm);
         state.tier = SubscriptionTier::AdminFree;
         state.expires_at = None;
+        save_state(&app, &state);
         info!("Activated AdminFree tier for {}", email_norm);
+        return Ok(to_status(&state));
+    }
+
+    // Verify the key with the licensing backend before trusting it.
+    let url = format!("{}/api/license/verify", backend_base_url());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "key": key_norm,
+            "email": email_norm,
+            "deviceId": device_id,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach licensing backend to verify the key: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("License verification failed ({})", resp.status()));
+    }
+
+    #[derive(Deserialize)]
+    struct VerifyResp {
+        valid: bool,
+        tier: Option<String>,
+        #[serde(rename = "expiresAt")]
+        expires_at: Option<String>,
+        reason: Option<String>,
+    }
+    let parsed: VerifyResp = resp
+        .json()
+        .await
+        .map_err(|e| format!("Bad verification response: {e}"))?;
+
+    if !parsed.valid {
+        return Err(format!(
+            "License key rejected: {}",
+            parsed.reason.unwrap_or_else(|| "invalid key".into())
+        ));
+    }
+
+    state.email = Some(email_norm.clone());
+    state.license_key = Some(key_norm);
+    if parsed.tier.as_deref() == Some("admin_free") {
+        state.tier = SubscriptionTier::AdminFree;
+        state.expires_at = None;
     } else {
         state.tier = SubscriptionTier::Premium;
-        let expires = Utc::now() + Duration::days(SUBSCRIPTION_DURATION_DAYS);
-        state.expires_at = Some(expires.to_rfc3339());
-        info!("Activated Premium tier for {} until {}", email_norm, expires);
+        state.expires_at = parsed.expires_at.or_else(|| {
+            Some((Utc::now() + Duration::days(SUBSCRIPTION_DURATION_DAYS)).to_rfc3339())
+        });
     }
 
     save_state(&app, &state);
+    info!(
+        "Activated {:?} tier for {} (verified by backend)",
+        state.tier, email_norm
+    );
     Ok(to_status(&state))
 }
 
@@ -370,11 +438,7 @@ pub async fn initiate_subscription_payment(
     save_state(&app, &state);
     let device_id = state.device_id.clone().unwrap_or_default();
 
-    let backend = option_env!("VOCRIT_LICENSE_BACKEND_URL")
-        .unwrap_or("https://api.vocrit.ai")
-        .trim_end_matches('/')
-        .to_string();
-    let url = format!("{backend}/api/checkout");
+    let url = format!("{}/api/checkout", backend_base_url());
 
     let body = serde_json::json!({
         "email": email_norm,
@@ -431,14 +495,23 @@ pub async fn check_payment_and_activate(
     app: AppHandle,
     session_id: String,
 ) -> Result<SubscriptionStatus, String> {
+    // Session ids are nanoid-style tokens; refuse anything else so the value
+    // can't be used to rewrite the request path.
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("Invalid session id".into());
+    }
+
     let state = load_state(&app);
     let device_id = state.device_id.clone().unwrap_or_default();
 
-    let backend = option_env!("VOCRIT_LICENSE_BACKEND_URL")
-        .unwrap_or("https://api.vocrit.ai")
-        .trim_end_matches('/')
-        .to_string();
-    let url = format!("{backend}/api/checkout/{session_id}?device_id={device_id}");
+    let url = format!(
+        "{}/api/checkout/{session_id}?device_id={device_id}",
+        backend_base_url()
+    );
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
@@ -467,10 +540,13 @@ pub async fn check_payment_and_activate(
         .map_err(|e| format!("Bad status response: {e}"))?;
 
     if parsed.status != "paid" {
-        return Err(format!("Payment not completed yet (status: {})", parsed.status));
+        return Err(format!(
+            "Payment not completed yet (status: {})",
+            parsed.status
+        ));
     }
 
     let email = parsed.email.ok_or("Backend omitted email")?;
     let key = parsed.license_key.ok_or("Backend omitted license_key")?;
-    activate_license(app, email, key)
+    activate_license(app, email, key).await
 }

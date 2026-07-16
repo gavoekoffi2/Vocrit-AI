@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import { nanoid } from "nanoid";
 import { db, migrate } from "./db.js";
-import { createCheckout, verifyWebhook } from "./moneyFusion.js";
+import { createCheckout, verifyWebhook, isStubMode } from "./moneyFusion.js";
 import { issueLicense, verifyLicense, isAdmin } from "./licenses.js";
 
 const {
@@ -187,33 +187,47 @@ app.post("/api/webhook/money-fusion", (req, res) => {
  * Dev-only stub that simulates a successful payment. The Money Fusion STUB
  * checkout URL points here so the full purchase flow can be exercised locally
  * without real credentials.
+ *
+ * Only registered in stub mode: in production this route would hand out free
+ * premium licenses to anyone holding a session id.
  */
-app.all("/api/dev/fake-pay", (req, res) => {
-  const sessionId = req.query.session || req.body?.session;
-  if (!sessionId) return res.status(400).send("missing ?session=");
-  const session = db
-    .prepare("SELECT * FROM checkout_sessions WHERE id = ? LIMIT 1")
-    .get(sessionId);
-  if (!session) return res.status(404).send("unknown session");
-
-  const license = issueLicense({
-    email: session.email,
-    deviceId: session.device_id,
-    tier: "premium",
-  });
-  db.prepare(
-    `UPDATE checkout_sessions
-     SET status = 'paid', license_key = ?, updated_at = datetime('now')
-     WHERE id = ?`,
-  ).run(license.key, sessionId);
-
-  res.type("html").send(
-    `<h1>Vocrit AI — paiement simulé</h1>
-       <p>Session <code>${sessionId}</code> marquée comme payée.</p>
-       <p>Votre clé de licence&nbsp;: <code>${license.key}</code></p>
-       <p>Vous pouvez fermer cette fenêtre et revenir à l'application.</p>`,
+const escapeHtml = (value) =>
+  String(value).replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ],
   );
-});
+
+if (isStubMode()) {
+  app.all("/api/dev/fake-pay", (req, res) => {
+    const sessionId = req.query.session || req.body?.session;
+    if (!sessionId) return res.status(400).send("missing ?session=");
+    const session = db
+      .prepare("SELECT * FROM checkout_sessions WHERE id = ? LIMIT 1")
+      .get(sessionId);
+    if (!session) return res.status(404).send("unknown session");
+
+    const license = issueLicense({
+      email: session.email,
+      deviceId: session.device_id,
+      tier: "premium",
+    });
+    db.prepare(
+      `UPDATE checkout_sessions
+       SET status = 'paid', license_key = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+    ).run(license.key, sessionId);
+
+    res.type("html").send(
+      `<h1>Vocrit AI — paiement simulé</h1>
+         <p>Session <code>${escapeHtml(sessionId)}</code> marquée comme payée.</p>
+         <p>Votre clé de licence&nbsp;: <code>${escapeHtml(license.key)}</code></p>
+         <p>Vous pouvez fermer cette fenêtre et revenir à l'application.</p>`,
+    );
+  });
+}
 
 /**
  * Admin-only: issue a free lifetime license. Protected by ADMIN_MASTER_KEY

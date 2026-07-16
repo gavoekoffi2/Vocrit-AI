@@ -91,15 +91,27 @@ export async function createCheckout({
   return { checkoutUrl, providerReference };
 }
 
+/** True when running without real Money Fusion credentials (local testing). */
+export function isStubMode() {
+  return !MONEY_FUSION_API_KEY && process.env.NODE_ENV !== "production";
+}
+
 /**
  * Verify that a webhook body came from Money Fusion. The real verification
  * should check an HMAC signature in the request header against the secret
  * configured in the merchant dashboard — their docs explain the scheme.
  *
- * For the scaffold we only check a shared secret in the body.
+ * Fails CLOSED when no secret is configured outside stub mode: an unsigned
+ * webhook endpoint would let anyone mark sessions as paid and mint licenses.
  */
 export function verifyWebhook(body, providedSecret) {
   const secret = process.env.MONEY_FUSION_WEBHOOK_SECRET;
-  if (!secret) return true; // dev mode
+  if (!secret) {
+    if (isStubMode()) return true; // local dev only
+    console.error(
+      "[moneyFusion] MONEY_FUSION_WEBHOOK_SECRET is not set — rejecting webhook",
+    );
+    return false;
+  }
   return providedSecret === secret;
 }
