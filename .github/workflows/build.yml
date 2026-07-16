@@ -3,6 +3,8 @@ on:
   push:
     branches:
       - main
+      - claude/**
+  workflow_dispatch:
 
 jobs:
   build:
@@ -61,5 +63,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DomefaAI-Windows
+          name: Vocrit-AI-Windows-Setup
           path: C:/t/release/bundle/nsis/*.exe
