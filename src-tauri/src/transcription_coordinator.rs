@@ -9,6 +9,13 @@ use tauri::{AppHandle, Manager};
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
 
+/// A press-and-release shorter than this is treated as a *tap*: instead of
+/// stopping the recording on release (which would capture only a fraction of
+/// a second of audio and transcribe nothing), the recording latches on and
+/// keeps running until the shortcut is pressed again. Holding the shortcut
+/// longer than this behaves as classic push-to-talk.
+const TAP_TO_TOGGLE_THRESHOLD: Duration = Duration::from_millis(600);
+
 /// Commands processed sequentially by the coordinator thread.
 enum Command {
     Input {
@@ -26,7 +33,14 @@ enum Command {
 /// Pipeline lifecycle, owned exclusively by the coordinator thread.
 enum Stage {
     Idle,
-    Recording(String), // binding_id
+    Recording {
+        binding_id: String,
+        /// When the recording was started by a key press.
+        started_at: Instant,
+        /// True once the recording survived a quick tap-release and is now
+        /// latched on: the next press stops it.
+        latched: bool,
+    },
     Processing,
 }
 
@@ -70,19 +84,43 @@ impl TranscriptionCoordinator {
                             }
 
                             if push_to_talk {
-                                if is_pressed && matches!(stage, Stage::Idle) {
-                                    start(&app, &mut stage, &binding_id, &hotkey_string);
-                                } else if !is_pressed
-                                    && matches!(&stage, Stage::Recording(id) if id == &binding_id)
-                                {
-                                    stop(&app, &mut stage, &binding_id, &hotkey_string);
+                                match &mut stage {
+                                    Stage::Idle if is_pressed => {
+                                        start(&app, &mut stage, &binding_id, &hotkey_string);
+                                    }
+                                    Stage::Recording {
+                                        binding_id: id,
+                                        started_at,
+                                        latched,
+                                    } if id == &binding_id => {
+                                        if is_pressed {
+                                            // Key-repeat presses arrive while the key is
+                                            // held; only a press AFTER the latch counts
+                                            // as "stop the latched recording".
+                                            if *latched {
+                                                stop(&app, &mut stage, &binding_id, &hotkey_string);
+                                            }
+                                        } else if started_at.elapsed() < TAP_TO_TOGGLE_THRESHOLD {
+                                            // Quick tap: keep recording (toggle mode)
+                                            // instead of stopping with near-empty audio.
+                                            debug!(
+                                                "Tap detected for '{binding_id}': latching recording on"
+                                            );
+                                            *latched = true;
+                                        } else {
+                                            stop(&app, &mut stage, &binding_id, &hotkey_string);
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             } else if is_pressed {
                                 match &stage {
                                     Stage::Idle => {
                                         start(&app, &mut stage, &binding_id, &hotkey_string);
                                     }
-                                    Stage::Recording(id) if id == &binding_id => {
+                                    Stage::Recording { binding_id: id, .. }
+                                        if id == &binding_id =>
+                                    {
                                         stop(&app, &mut stage, &binding_id, &hotkey_string);
                                     }
                                     _ => {
@@ -96,7 +134,8 @@ impl TranscriptionCoordinator {
                         } => {
                             // Don't reset during processing — wait for the pipeline to finish.
                             if !matches!(stage, Stage::Processing)
-                                && (recording_was_active || matches!(stage, Stage::Recording(_)))
+                                && (recording_was_active
+                                    || matches!(stage, Stage::Recording { .. }))
                             {
                                 stage = Stage::Idle;
                             }
@@ -168,7 +207,11 @@ fn start(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &s
         .try_state::<Arc<AudioRecordingManager>>()
         .map_or(false, |a| a.is_recording())
     {
-        *stage = Stage::Recording(binding_id.to_string());
+        *stage = Stage::Recording {
+            binding_id: binding_id.to_string(),
+            started_at: Instant::now(),
+            latched: false,
+        };
     } else {
         debug!("Start for '{binding_id}' did not begin recording; staying idle");
     }

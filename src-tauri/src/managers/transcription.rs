@@ -263,10 +263,28 @@ impl TranscriptionManager {
             },
         );
 
-        let model_info = self
-            .model_manager
-            .get_model_info(model_id)
-            .ok_or_else(|| anyhow::anyhow!("Model not found: {}", model_id))?;
+        let model_info = match self.model_manager.get_model_info(model_id) {
+            Some(info) => info,
+            None => {
+                // Covers the empty-selection case (fresh install with no model)
+                // — without this event the UI never learns the load failed.
+                let error_msg = if model_id.is_empty() {
+                    "No transcription model is selected".to_string()
+                } else {
+                    format!("Model not found: {}", model_id)
+                };
+                let _ = self.app_handle.emit(
+                    "model-state-changed",
+                    ModelStateEvent {
+                        event_type: "loading_failed".to_string(),
+                        model_id: Some(model_id.to_string()),
+                        model_name: None,
+                        error: Some(error_msg.clone()),
+                    },
+                );
+                return Err(anyhow::anyhow!(error_msg));
+            }
+        };
 
         if !model_info.is_downloaded {
             let error_msg = "Model not downloaded";

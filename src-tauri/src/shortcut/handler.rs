@@ -11,12 +11,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// This is the single bridge between OS-level key events and the transcription
 /// pipeline. It MUST forward the event to the `TranscriptionCoordinator` for
 /// transcribe bindings — otherwise pressing the shortcut does nothing at all.
-pub fn handle_shortcut_event(
-    app: &AppHandle,
-    binding_id: &str,
-    shortcut: &str,
-    is_pressed: bool,
-) {
+pub fn handle_shortcut_event(app: &AppHandle, binding_id: &str, shortcut: &str, is_pressed: bool) {
     debug!(
         "Shortcut event: binding='{}' shortcut='{}' pressed={}",
         binding_id, shortcut, is_pressed

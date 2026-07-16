@@ -3,7 +3,7 @@ use crate::input::{self, EnigoState};
 use crate::settings::TypingTool;
 use crate::settings::{get_settings, AutoSubmitKey, ClipboardHandling, PasteMethod};
 use enigo::{Direction, Enigo, Key, Keyboard};
-use log::info;
+use log::{info, warn};
 use std::process::Command;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
@@ -29,7 +29,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, IsIconic, IsWindow, SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
 
+#[cfg(not(target_os = "linux"))]
 const CLIPBOARD_WRITE_VERIFY_TIMEOUT_MS: u64 = 700;
+#[cfg(not(target_os = "linux"))]
 const CLIPBOARD_WRITE_VERIFY_INTERVAL_MS: u64 = 25;
 const CLIPBOARD_RESTORE_DELAY_MS: u64 = 450;
 
@@ -73,18 +75,25 @@ fn restore_paste_target_window() {
     std::thread::sleep(Duration::from_millis(120));
 }
 
+/// Best-effort wait for the clipboard to contain `expected`. Some clipboard
+/// managers normalize text (line endings, trailing whitespace), so a timeout
+/// here must NOT abort the paste — we log and proceed with the keystroke.
 #[cfg(not(target_os = "linux"))]
-fn wait_for_clipboard_text(app_handle: &AppHandle, expected: &str) -> Result<(), String> {
+fn wait_for_clipboard_text(app_handle: &AppHandle, expected: &str) {
     let clipboard = app_handle.clipboard();
     let started = std::time::Instant::now();
 
     loop {
         if clipboard.read_text().unwrap_or_default() == expected {
-            return Ok(());
+            return;
         }
 
         if started.elapsed() >= Duration::from_millis(CLIPBOARD_WRITE_VERIFY_TIMEOUT_MS) {
-            return Err("Clipboard did not update before paste".into());
+            log::warn!(
+                "Clipboard content did not match within {}ms; attempting paste anyway",
+                CLIPBOARD_WRITE_VERIFY_TIMEOUT_MS
+            );
+            return;
         }
 
         std::thread::sleep(Duration::from_millis(CLIPBOARD_WRITE_VERIFY_INTERVAL_MS));
@@ -186,6 +195,12 @@ fn unicode_input(unit: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     }
 }
 
+/// Maximum keyboard events per SendInput batch. Large single calls can be
+/// partially dropped by slow applications; batching with a short pause keeps
+/// long transcripts reliable.
+#[cfg(target_os = "windows")]
+const SEND_INPUT_BATCH_EVENTS: usize = 128;
+
 #[cfg(target_os = "windows")]
 fn type_text_direct_windows(text: &str) -> Result<(), String> {
     restore_paste_target_window();
@@ -201,13 +216,18 @@ fn type_text_direct_windows(text: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent != inputs.len() as u32 {
-        return Err(format!(
-            "Windows SendInput typed {} of {} unicode events",
-            sent,
-            inputs.len()
-        ));
+    for batch in inputs.chunks(SEND_INPUT_BATCH_EVENTS) {
+        let sent = unsafe { SendInput(batch, std::mem::size_of::<INPUT>() as i32) };
+        if sent != batch.len() as u32 {
+            return Err(format!(
+                "Windows SendInput typed {} of {} unicode events",
+                sent,
+                batch.len()
+            ));
+        }
+        if inputs.len() > SEND_INPUT_BATCH_EVENTS {
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     Ok(())
@@ -247,7 +267,7 @@ fn paste_via_clipboard(
     write_result?;
 
     #[cfg(not(target_os = "linux"))]
-    wait_for_clipboard_text(app_handle, text)?;
+    wait_for_clipboard_text(app_handle, text);
 
     std::thread::sleep(Duration::from_millis(paste_delay_ms.max(120)));
 
@@ -855,24 +875,8 @@ fn send_return_key_windows(key_type: AutoSubmitKey) -> Result<(), String> {
 
 pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
     let settings = get_settings(&app_handle);
-    let mut paste_method = settings.paste_method;
+    let paste_method = settings.paste_method;
     let paste_delay_ms = settings.paste_delay_ms;
-
-    #[cfg(target_os = "windows")]
-    {
-        // Existing installations may still have a clipboard/none method saved
-        // from earlier builds. Windows Unicode input is more reliable for the
-        // app's core promise: put the transcript directly where the cursor is.
-        if matches!(
-            paste_method,
-            PasteMethod::None
-                | PasteMethod::CtrlV
-                | PasteMethod::CtrlShiftV
-                | PasteMethod::ShiftInsert
-        ) {
-            paste_method = PasteMethod::Direct;
-        }
-    }
 
     // Append trailing space if setting is enabled
     let text = if settings.append_trailing_space {
@@ -928,13 +932,27 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
             )?;
         }
         PasteMethod::CtrlV | PasteMethod::CtrlShiftV | PasteMethod::ShiftInsert => {
-            paste_via_clipboard(
+            if let Err(clipboard_err) = paste_via_clipboard(
                 &mut enigo,
                 &text,
                 &app_handle,
                 &paste_method,
                 paste_delay_ms,
-            )?
+            ) {
+                // The transcript must never be silently lost: if the
+                // clipboard path fails (locked clipboard, blocked keystroke),
+                // fall back to typing the text directly at the cursor.
+                warn!(
+                    "Clipboard paste failed ({}); falling back to direct typing",
+                    clipboard_err
+                );
+                paste_direct(
+                    &mut enigo,
+                    &text,
+                    #[cfg(target_os = "linux")]
+                    settings.typing_tool,
+                )?;
+            }
         }
         PasteMethod::ExternalScript => {
             let script_path = settings

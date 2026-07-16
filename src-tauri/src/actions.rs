@@ -57,16 +57,15 @@ fn save_history_after_paste(
         })
         .await
         {
-            Ok(Ok(())) => match crate::audio_toolkit::verify_wav_file(
-                &wav_path_for_verify,
-                sample_count,
-            ) {
-                Ok(()) => true,
-                Err(e) => {
-                    error!("WAV verification failed: {}", e);
-                    false
+            Ok(Ok(())) => {
+                match crate::audio_toolkit::verify_wav_file(&wav_path_for_verify, sample_count) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        error!("WAV verification failed: {}", e);
+                        false
+                    }
                 }
-            },
+            }
             Ok(Err(e)) => {
                 error!("Failed to save WAV file: {}", e);
                 false
@@ -657,7 +656,14 @@ impl ShortcutAction for TranscribeAction {
                             }
                         }
                         Err(err) => {
-                            debug!("Global Shortcut Transcription error: {}", err);
+                            error!("Transcription failed: {}", err);
+                            // Surface the failure to the user — a silent failure
+                            // looks like "the app types nothing" and is impossible
+                            // to diagnose without reading log files.
+                            let _ = ah.emit(
+                                "transcription-error",
+                                serde_json::json!({ "error": err.to_string() }),
+                            );
                             // Save the failed recording in the background so the
                             // user can retry without slowing the UI path.
                             save_history_after_paste(
