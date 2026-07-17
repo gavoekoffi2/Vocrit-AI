@@ -430,6 +430,10 @@ pub struct AppSettings {
     pub whisper_gpu_device: i32,
     #[serde(default)]
     pub extra_recording_buffer_ms: u64,
+    /// One-time flag: true once the "auto → locale language" migration has run
+    /// for this settings file. Prevents re-clobbering the user's later choice.
+    #[serde(default)]
+    pub transcription_language_migrated: bool,
 }
 
 fn default_model() -> String {
@@ -740,6 +744,25 @@ fn normalize_platform_settings(settings: &mut AppSettings) -> bool {
     #[allow(unused_mut)]
     let mut changed = false;
 
+    // One-time transcription-language migration. Existing installs created
+    // before locale-aware defaults stored "auto", which makes limited-language
+    // models (e.g. Canary) fall back to English output. Resolve it once to the
+    // OS-locale language so French users get French. Guarded by a flag so a
+    // user who deliberately re-selects "auto" afterwards is never overridden.
+    if !settings.transcription_language_migrated {
+        if settings.selected_language == "auto" {
+            if let Some(language) = infer_transcription_language(&settings.app_language) {
+                debug!(
+                    "One-time migration: transcription language 'auto' -> '{}' (locale '{}')",
+                    language, settings.app_language
+                );
+                settings.selected_language = language;
+            }
+        }
+        settings.transcription_language_migrated = true;
+        changed = true;
+    }
+
     #[cfg(target_os = "windows")]
     {
         if settings.keyboard_implementation == KeyboardImplementation::VocalWriteKeys {
@@ -748,9 +771,6 @@ fn normalize_platform_settings(settings: &mut AppSettings) -> bool {
             changed = true;
         }
     }
-
-    #[cfg(not(target_os = "windows"))]
-    let _ = settings;
 
     changed
 }
@@ -824,7 +844,11 @@ pub fn get_default_settings() -> AppSettings {
         clamshell_microphone: None,
         selected_output_device: None,
         translate_to_english: false,
-        selected_language: "auto".to_string(),
+        // Default to the language inferred from the OS locale (e.g. French
+        // installs get "fr") so speech is transcribed in the user's own
+        // language instead of the model's English fallback. New installs are
+        // already correct, so they skip the one-time migration below.
+        selected_language: default_selected_language(),
         overlay_position: default_overlay_position(),
         debug_mode: false,
         log_level: default_log_level(),
@@ -859,6 +883,7 @@ pub fn get_default_settings() -> AppSettings {
         ort_accelerator: OrtAcceleratorSetting::default(),
         whisper_gpu_device: default_whisper_gpu_device(),
         extra_recording_buffer_ms: 0,
+        transcription_language_migrated: true,
     }
 }
 
