@@ -363,6 +363,12 @@ pub struct AppSettings {
     pub translate_to_english: bool,
     #[serde(default = "default_selected_language")]
     pub selected_language: String,
+    /// One-time flag: `false` on stores created before the French-default
+    /// migration. Ensures the transcription language is reset to French exactly
+    /// once (see `normalize_platform_settings`), after which the user's explicit
+    /// choice is always preserved.
+    #[serde(default)]
+    pub language_default_migrated: bool,
     #[serde(default = "default_overlay_position")]
     pub overlay_position: OverlayPosition,
     #[serde(default = "default_debug_mode")]
@@ -444,32 +450,11 @@ fn default_translate_to_english() -> bool {
     false
 }
 
-fn infer_transcription_language(locale: &str) -> Option<String> {
-    let normalized = locale.trim().replace('_', "-").to_lowercase();
-    if normalized.is_empty() {
-        return None;
-    }
-
-    if normalized.starts_with("zh-hant")
-        || normalized.ends_with("-tw")
-        || normalized.ends_with("-hk")
-        || normalized.ends_with("-mo")
-    {
-        return Some("zh-Hant".to_string());
-    }
-
-    if normalized.starts_with("zh") {
-        return Some("zh-Hans".to_string());
-    }
-
-    let base = normalized.split('-').next().unwrap_or_default();
-    match base {
-        "fr" | "en" | "es" | "de" | "it" | "pt" | "nl" | "ru" | "uk" | "ar" | "ja" | "ko"
-        | "tr" | "pl" | "sv" | "da" | "fi" | "no" | "cs" | "ro" | "hu" | "el" | "bg" | "hr"
-        | "sk" | "sl" | "et" | "lv" | "lt" => Some(base.to_string()),
-        _ => None,
-    }
-}
+/// The product default transcription language.
+///
+/// Vocrit is French-first: dictation transcribes in French out of the box.
+/// Users can still pick any other language (or "auto") from the UI.
+pub const DEFAULT_TRANSCRIPTION_LANGUAGE: &str = "fr";
 
 fn default_start_hidden() -> bool {
     false
@@ -484,7 +469,7 @@ fn default_update_checks_enabled() -> bool {
 }
 
 fn default_selected_language() -> String {
-    infer_transcription_language(&default_app_language()).unwrap_or_else(|| "auto".to_string())
+    DEFAULT_TRANSCRIPTION_LANGUAGE.to_string()
 }
 
 fn default_overlay_position() -> OverlayPosition {
@@ -734,19 +719,28 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
 fn normalize_platform_settings(settings: &mut AppSettings) -> bool {
     let mut changed = false;
 
-    if settings.selected_language == "auto" {
-        if let Some(language) = infer_transcription_language(&settings.app_language) {
+    // One-time French-default migration. Older builds either left the language on
+    // "auto" (which biased Whisper toward English) or inferred it from the OS
+    // locale, permanently locking non-French machines into English. Vocrit is a
+    // French-first product, so reset the transcription language to French exactly
+    // once. The flag guarantees we never override the user's explicit choice
+    // afterward — they remain free to pick English, "auto", or any language.
+    if !settings.language_default_migrated {
+        if settings.selected_language != DEFAULT_TRANSCRIPTION_LANGUAGE {
             debug!(
-                "Migrating transcription language from auto to '{}' based on app language '{}'",
-                language, settings.app_language
+                "Applying French-default migration: '{}' -> '{}'",
+                settings.selected_language, DEFAULT_TRANSCRIPTION_LANGUAGE
             );
-            settings.selected_language = language;
-            changed = true;
+            settings.selected_language = DEFAULT_TRANSCRIPTION_LANGUAGE.to_string();
         }
+        settings.language_default_migrated = true;
+        changed = true;
     }
 
-    if settings.app_language.to_lowercase().starts_with("fr") && settings.translate_to_english {
-        debug!("Disabling translate_to_english for French locale settings");
+    // Never translate French dictation to English by default.
+    if settings.selected_language == DEFAULT_TRANSCRIPTION_LANGUAGE && settings.translate_to_english
+    {
+        debug!("Disabling translate_to_english for French transcription");
         settings.translate_to_english = false;
         changed = true;
     }
@@ -838,7 +832,8 @@ pub fn get_default_settings() -> AppSettings {
         clamshell_microphone: None,
         selected_output_device: None,
         translate_to_english: false,
-        selected_language: "auto".to_string(),
+        selected_language: default_selected_language(),
+        language_default_migrated: true,
         overlay_position: default_overlay_position(),
         debug_mode: false,
         log_level: default_log_level(),
@@ -1019,6 +1014,34 @@ mod tests {
         let settings = get_default_settings();
         assert!(!settings.auto_submit);
         assert_eq!(settings.auto_submit_key, AutoSubmitKey::Enter);
+    }
+
+    #[test]
+    fn default_transcription_language_is_french() {
+        let settings = get_default_settings();
+        assert_eq!(settings.selected_language, "fr");
+        assert!(!settings.translate_to_english);
+        // Fresh installs already default to French, so the one-time migration
+        // must be marked as done to avoid re-triggering.
+        assert!(settings.language_default_migrated);
+    }
+
+    #[test]
+    fn french_migration_resets_legacy_language_once() {
+        // Simulate a legacy store stuck in English by the old locale inference.
+        let mut settings = get_default_settings();
+        settings.selected_language = "en".to_string();
+        settings.language_default_migrated = false;
+
+        // First normalization forces French and marks the migration done.
+        assert!(normalize_platform_settings(&mut settings));
+        assert_eq!(settings.selected_language, "fr");
+        assert!(settings.language_default_migrated);
+
+        // After migration the user's explicit choice must be preserved.
+        settings.selected_language = "en".to_string();
+        normalize_platform_settings(&mut settings);
+        assert_eq!(settings.selected_language, "en");
     }
 
     #[test]

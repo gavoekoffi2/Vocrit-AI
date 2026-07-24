@@ -811,8 +811,18 @@ impl ModelManager {
         if should_prefer_fast_default {
             let models = self.available_models.lock().unwrap();
             let available_model = models
+                // Canary 180M Flash: fast and French-capable — the ideal default.
                 .get("canary-180m-flash")
                 .filter(|model| model.is_downloaded)
+                // Otherwise prefer any downloaded model that can transcribe French,
+                // so the French-default language actually works out of the box.
+                .or_else(|| {
+                    models.values().find(|model| {
+                        model.is_downloaded
+                            && model.supported_languages.iter().any(|lang| lang == "fr")
+                    })
+                })
+                // Last resort: any downloaded model.
                 .or_else(|| models.values().find(|model| model.is_downloaded));
 
             if let Some(available_model) = available_model {
