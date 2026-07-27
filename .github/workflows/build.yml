@@ -9,6 +9,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
     env:
       CARGO_TARGET_DIR: C:\t
     steps:
@@ -65,3 +67,15 @@ jobs:
         with:
           name: DomefaAI-Windows
           path: C:/t/release/bundle/nsis/*.exe
+      # Publish the installer as a GitHub Release asset so it has a permanent,
+      # public download link (clickable without a GitHub login, no zip).
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-latest
+          name: Vocrit AI — Windows (French default)
+          body: |
+            Installateur Windows de Vocrit AI avec la transcription en français par défaut.
+            Téléchargez le fichier `.exe` ci-dessous et double-cliquez pour installer.
+          files: C:/t/release/bundle/nsis/*.exe
+          fail_on_unmatched_files: true
